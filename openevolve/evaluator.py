@@ -15,6 +15,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import traceback
 
@@ -28,6 +29,10 @@ from openevolve.prompt.sampler import PromptSampler
 from openevolve.utils.format_utils import format_metrics_safe
 
 logger = logging.getLogger(__name__)
+
+# Evaluation functions may return a plain metrics dictionary (backward compatible) or an
+# EvaluationResult carrying the metrics together with artifacts.
+EvaluationReturn = Union[Dict[str, float], EvaluationResult]
 
 
 class Evaluator:
@@ -67,8 +72,12 @@ class Evaluator:
         # Set up evaluation function if file exists
         self._load_evaluation_function()
 
-        # Pending artifacts storage for programs
-        self._pending_artifacts: Dict[str, Dict[str, Union[str, bytes]]] = {}
+        # Pending artifacts storage for programs.
+        # Artifact values are an arbitrary JSON-serializable side channel rather than
+        # text/binary only: this module itself stores flags ("timeout": True) and
+        # counters ("timeout_duration", "attempt") next to evaluator-provided text
+        # and binary artifacts, and LLM feedback artifacts may be any parsed JSON.
+        self._pending_artifacts: Dict[str, Dict[str, Any]] = {}
 
         logger.info(f"Initialized evaluator with {evaluation_file}")
 
@@ -97,7 +106,9 @@ class Evaluator:
                     f"Evaluation file {self.evaluation_file} does not contain an 'evaluate' function"
                 )
 
-            self.evaluate_function = module.evaluate
+            # The evaluation module is loaded dynamically, so the signature of its
+            # "evaluate" entry point is recorded explicitly for type checking.
+            self.evaluate_function: Callable[[str], EvaluationReturn] = module.evaluate
             logger.info(f"Successfully loaded evaluation function from {self.evaluation_file}")
 
             # Validate cascade configuration
@@ -106,7 +117,7 @@ class Evaluator:
             logger.error(f"Error loading evaluation function: {str(e)}")
             raise
 
-    def _validate_cascade_configuration(self, module) -> None:
+    def _validate_cascade_configuration(self, module: ModuleType) -> None:
         """
         Validate cascade evaluation configuration and warn about potential issues
 
@@ -324,7 +335,7 @@ class Evaluator:
             logger.warning(f"Unexpected evaluation result type: {type(result)}")
             return EvaluationResult(metrics={"error": 0.0})
 
-    def get_pending_artifacts(self, program_id: str) -> Optional[Dict[str, Union[str, bytes]]]:
+    def get_pending_artifacts(self, program_id: str) -> Optional[Dict[str, Any]]:
         """
         Get and clear pending artifacts for a program
 
@@ -336,9 +347,7 @@ class Evaluator:
         """
         return self._pending_artifacts.pop(program_id, None)
 
-    async def _direct_evaluate(
-        self, program_path: str
-    ) -> Union[Dict[str, float], EvaluationResult]:
+    async def _direct_evaluate(self, program_path: str) -> EvaluationReturn:
         """
         Directly evaluate a program using the evaluation function with timeout
 
@@ -354,7 +363,7 @@ class Evaluator:
         """
 
         # Create a coroutine that runs the evaluation function in an executor
-        async def run_evaluation():
+        async def run_evaluation() -> EvaluationReturn:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(self._executor, self.evaluate_function, program_path)
 
@@ -365,9 +374,7 @@ class Evaluator:
         # This supports both dict and EvaluationResult returns, just like _cascade_evaluate
         return result
 
-    async def _cascade_evaluate(
-        self, program_path: str
-    ) -> Union[Dict[str, float], EvaluationResult]:
+    async def _cascade_evaluate(self, program_path: str) -> EvaluationReturn:
         """
         Run cascade evaluation with increasingly challenging test cases
 
@@ -399,7 +406,7 @@ class Evaluator:
             # Run first stage with timeout
             try:
 
-                async def run_stage1():
+                async def run_stage1() -> Any:
                     loop = asyncio.get_event_loop()
                     return await loop.run_in_executor(
                         self._executor, module.evaluate_stage1, program_path
@@ -442,7 +449,7 @@ class Evaluator:
             # Run second stage with timeout
             try:
 
-                async def run_stage2():
+                async def run_stage2() -> Any:
                     loop = asyncio.get_event_loop()
                     return await loop.run_in_executor(
                         self._executor, module.evaluate_stage2, program_path
@@ -506,7 +513,7 @@ class Evaluator:
             # Run third stage with timeout
             try:
 
-                async def run_stage3():
+                async def run_stage3() -> Any:
                     loop = asyncio.get_event_loop()
                     return await loop.run_in_executor(
                         self._executor, module.evaluate_stage3, program_path
@@ -561,7 +568,7 @@ class Evaluator:
                 },
             )
 
-    async def _llm_evaluate(self, program_code: str, program_id: str = "") -> Dict[str, float]:
+    async def _llm_evaluate(self, program_code: str, program_id: str = "") -> EvaluationReturn:
         """
         Use LLM to evaluate code quality
 
@@ -570,9 +577,13 @@ class Evaluator:
             program_id: Optional ID for logging
 
         Returns:
-            Dictionary of metric name to score
+            An EvaluationResult carrying the averaged LLM metrics in its metrics and
+            all non-numeric LLM outputs (e.g. its reasoning) as artifacts. An empty
+            dictionary of metrics is returned when no LLM evaluation is possible.
         """
-        if not self.llm_ensemble:
+        # Both an ensemble and a prompt sampler are required to build the evaluation
+        # prompt; without the sampler there is nothing to evaluate with.
+        if not self.llm_ensemble or not self.prompt_sampler:
             return {}
 
         try:
@@ -605,7 +616,7 @@ class Evaluator:
                 import re
 
                 artifacts = {}
-                avg_metrics = {}
+                avg_metrics: Dict[str, float] = {}
                 for i, response in enumerate(responses):
                     json_match = re.search(json_pattern, response, re.DOTALL)
 
@@ -733,7 +744,7 @@ class Evaluator:
         Returns:
             List of metric dictionaries
         """
-        tasks = [
+        tasks: List[asyncio.Task[Dict[str, float]]] = [
             self.task_pool.create_task(self.evaluate_program, program_code, program_id)
             for program_code, program_id in programs
         ]

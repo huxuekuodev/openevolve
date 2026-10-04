@@ -149,6 +149,12 @@ async def main_async() -> int:
                 )[-1]
 
         print(f"\nEvolution complete!")
+
+        # run() returns None when no program could be evaluated at all
+        if best_program is None:
+            print("Error: No program was produced by the evolution run")
+            return 1
+
         print(f"Best program metrics:")
         for name, value in best_program.metrics.items():
             # Handle mixed types: format numbers as floats, others as strings

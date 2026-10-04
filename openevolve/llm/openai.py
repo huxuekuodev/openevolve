@@ -16,9 +16,15 @@ from typing import Any, Dict, List, Optional, Union
 
 import openai
 
+from openevolve.config import LLMModelConfig
 from openevolve.llm.base import LLMInterface
 
 logger = logging.getLogger(__name__)
+
+# Model names already announced at INFO level. This is process-local state, so it
+# lives at module scope rather than being stapled onto the shared `Logger`
+# object (which is a singleton and would leak state across modules).
+_announced_models: "set[str]" = set()
 
 
 def _iso_now() -> str:
@@ -49,24 +55,31 @@ class OpenAILLM(LLMInterface):
 
     def __init__(
         self,
-        model_cfg: Optional[dict] = None,
-    ):
+        model_cfg: LLMModelConfig,
+    ) -> None:
         self.model = model_cfg.name
         self.system_message = model_cfg.system_message
         self.temperature = model_cfg.temperature
         self.top_p = model_cfg.top_p
         self.max_tokens = model_cfg.max_tokens
         self.timeout = model_cfg.timeout
-        self.retries = model_cfg.retries
-        self.retry_delay = model_cfg.retry_delay
+        # `LLMModelConfig` leaves retries/retry_delay as None; only `LLMConfig`
+        # fills them in, and `update_model_params` only propagates to models that
+        # are attached to it. A directly-constructed `LLMModelConfig` (a
+        # supported usage) would therefore reach `range(retries + 1)` with None
+        # and raise `TypeError: unsupported operand type(s) for +`. Normalise
+        # once, here, so every downstream use sees a real int.
+        self.retries = model_cfg.retries if model_cfg.retries is not None else 0
+        self.retry_delay = model_cfg.retry_delay if model_cfg.retry_delay is not None else 0
         self.api_base = model_cfg.api_base
         self.api_key = model_cfg.api_key
         self.random_seed = getattr(model_cfg, "random_seed", None)
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
         self.last_usage: Optional[Dict[str, Any]] = None
+        self.client: Optional["openai.OpenAI"]
 
         # Manual mode: enabled via llm.manual_mode in config.yaml
-        self.manual_mode = (getattr(model_cfg, "manual_mode", False) is True)
+        self.manual_mode = getattr(model_cfg, "manual_mode", False) is True
         self.manual_queue_dir: Optional[Path] = None
 
         if self.manual_mode:
@@ -82,32 +95,28 @@ class OpenAILLM(LLMInterface):
         else:
             # Set up API client (normal mode)
             # OpenAI client requires max_retries to be int, not None
-            max_retries = self.retries if self.retries is not None else 0
             self.client = openai.OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
                 timeout=self.timeout,
-                max_retries=max_retries,
+                max_retries=self.retries,
             )
 
         # Only log unique models to reduce duplication
-        if not hasattr(logger, "_initialized_models"):
-            logger._initialized_models = set()
-
-        if self.model not in logger._initialized_models:
+        if self.model not in _announced_models:
             logger.info(f"Initialized OpenAI LLM with model: {self.model}")
-            logger._initialized_models.add(self.model)
+            _announced_models.add(str(self.model))
 
-    async def generate(self, prompt: str, **kwargs) -> str:
+    async def generate(self, prompt: str, **kwargs: Any) -> str:
         """Generate text from a prompt"""
         return await self.generate_with_context(
-            system_message=self.system_message,
+            system_message=self.system_message or "",
             messages=[{"role": "user", "content": prompt}],
             **kwargs,
         )
 
     async def generate_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs: Any
     ) -> str:
         """Generate text using a system message and conversational context"""
         # Prepare messages with system message
@@ -212,15 +221,21 @@ class OpenAILLM(LLMInterface):
                     logger.error(f"All {retries + 1} attempts failed with error: {str(e)}")
                     raise
 
+        # Unreachable: `retries` is >= 0, so the loop always runs at least once
+        # and its final attempt either returns or re-raises. This keeps the
+        # function total for the type checker.
+        raise RuntimeError("retry loop exited without returning a response")
+
     async def _call_api(self, params: Dict[str, Any]) -> str:
         """Make the actual API call"""
-        if self.client is None:
+        client = self.client
+        if client is None:
             raise RuntimeError("OpenAI client is not initialized (manual_mode enabled?)")
 
         # Use asyncio to run the blocking API call in a thread pool
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
-            None, lambda: self.client.chat.completions.create(**params, stream=False)
+            None, lambda: client.chat.completions.create(**params, stream=False)
         )
         if isinstance(response, str):
             # Some endpoints stream Server-Sent Events even when asked not to
@@ -229,7 +244,6 @@ class OpenAILLM(LLMInterface):
                 f"(streaming responses are not supported): {response[:200]!r}"
             )
         # Logging of system prompt, user message and response content
-        logger = logging.getLogger(__name__)
         logger.debug(f"API parameters: {params}")
         logger.debug(f"API response: {response.choices[0].message.content}")
 
@@ -254,7 +268,18 @@ class OpenAILLM(LLMInterface):
             self.last_usage = None
             logger.info(f"LLM Token Usage ({self.model}): usage info not returned by API")
 
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        if content is None:
+            # A provider can return a message with no text (e.g. a tool-call-only
+            # or refusal-only response). Returning None here would violate this
+            # method's `-> str` contract and only surface much later as a
+            # confusing "expected str" parse error on the generated code.
+            raise ValueError(
+                "LLM response contained no message content "
+                f"(finish_reason={getattr(response.choices[0], 'finish_reason', None)!r})"
+            )
+
+        return str(content)
 
     async def _manual_wait_for_answer(
         self, params: Dict[str, Any], timeout: Optional[Union[int, float]]

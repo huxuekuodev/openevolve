@@ -19,20 +19,50 @@ make install
 
 ### Running Tests
 ```bash
-# Run all tests
+# Full suite; tests/integration/ skips itself when no optillm server is reachable
+make test
+python -m pytest
+
+# Unit tests only (fast, no LLM required)
+make test-unit
+python -m pytest tests --ignore=tests/integration
+
+# Coverage
+make test-cov
+python -m pytest tests --ignore=tests/integration --cov=openevolve --cov-report=term-missing
+
+# Legacy unittest discovery (still supported)
+make test-unittest
 python -m unittest discover tests
 
-# Or use Makefile
-make test
+# Integration tests against a local optillm server
+make test-integration        # starts optillm itself
+make test-integration-dev    # uses an already-running server on :8000
 ```
+
+`OPENAI_API_KEY` must be set to any non-empty value for unit tests (no real API
+calls are made): `export OPENAI_API_KEY=test`.
+
+### Type Checking
+```bash
+make typecheck    # mypy; configured in pyproject.toml (files = ["openevolve"])
+python -m mypy
+```
+mypy is clean and is a hard CI gate. `# type: ignore` is not used anywhere in
+this codebase — fix the annotation or add the missing `None` guard instead.
 
 ### Code Formatting
 ```bash
-# Format with Black
-python -m black openevolve examples tests scripts
+make format         # isort + Black (rewrites files)
+make format-check   # verify only, no writes
 
-# Or use Makefile
-make lint
+# Or directly
+python -m black openevolve examples tests scripts
+```
+
+### PR Gate
+```bash
+make check    # typecheck + unit tests
 ```
 
 ### Running OpenEvolve
@@ -73,7 +103,7 @@ python scripts/visualizer.py --path examples/function_minimization/openevolve_ou
 
 4. **LLM Integration (`openevolve/llm/`)**: Ensemble approach with multiple models, configurable weights, and async generation with retry logic.
 
-5. **Iteration (`openevolve/iteration.py`)**: Worker process that samples from islands, generates mutations via LLM, evaluates programs, and stores artifacts.
+5. **Iteration (`openevolve/process_parallel.py`)**: Worker process that samples from islands, generates mutations via LLM, evaluates programs, and returns results to the controller (which owns all database writes).
 
 ### Key Architectural Patterns
 
@@ -112,7 +142,8 @@ YAML-based configuration with hierarchical structure:
 
 - Python >=3.10 required
 - Uses OpenAI-compatible APIs for LLM integration
-- Tests use unittest framework
-- Black for code formatting
-- Artifacts threshold: Small (<10KB) stored in DB, large saved to disk
-- Process workers load database snapshots for true parallelism
+- Tests run under pytest (which also collects the unittest-style `TestCase` classes); `make check` is the PR gate
+- mypy must stay clean; `# type: ignore` is not used in this codebase
+- Black (line-length 100) + isort for formatting; the repo has some pre-existing formatting drift, so `make format-check` is documented but not yet a CI gate
+- Artifacts threshold: artifacts under `database.artifact_size_threshold` (default 32KB) are stored in the DB, larger ones are saved to disk
+- Process workers load database snapshots for true parallelism; only the controller writes to the database

@@ -17,22 +17,27 @@ from openevolve.utils.metrics_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Only log the sampler initialization once per process to reduce duplication
+_prompt_sampler_logged = False
+
 
 class PromptSampler:
     """Generates prompts for code evolution"""
 
     def __init__(self, config: PromptConfig):
+        global _prompt_sampler_logged
+
         self.config = config
         self.template_manager = TemplateManager(custom_template_dir=config.template_dir)
 
         # Store custom template mappings
-        self.system_template_override = None
-        self.user_template_override = None
+        self.system_template_override: Optional[str] = None
+        self.user_template_override: Optional[str] = None
 
         # Only log once to reduce duplication
-        if not hasattr(logger, "_prompt_sampler_logged"):
+        if not _prompt_sampler_logged:
             logger.info("Initialized prompt sampler")
-            logger._prompt_sampler_logged = True
+            _prompt_sampler_logged = True
 
     def set_templates(
         self, system_template: Optional[str] = None, user_template: Optional[str] = None
@@ -177,7 +182,7 @@ class PromptSampler:
                 "user_message_with_changes_description"
             ).format(
                 user_message=user_message,
-                changes_description=current_changes_description.rstrip(),
+                changes_description=(current_changes_description or "").rstrip(),
             )
 
         return {

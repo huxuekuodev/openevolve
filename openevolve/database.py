@@ -17,7 +17,7 @@ from numbers import Integral
 from types import MappingProxyType
 
 # FileLock removed - no longer needed with threaded parallel processing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TypedDict, Union, cast
 
 import numpy as np
 
@@ -36,12 +36,14 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def _strategy_boundary():
+def _strategy_boundary() -> Iterator[None]:
     """Tag strategy failures without replacing their exception chain."""
     try:
         yield
     except Exception as exc:
-        exc._openevolve_strategy_error = True
+        # The tag is read back dynamically (getattr) by the parallel workers, so it
+        # is set through setattr rather than as a declared exception attribute.
+        setattr(exc, "_openevolve_strategy_error", True)
         raise
 
 
@@ -59,6 +61,20 @@ def _safe_avg_metrics(metrics: Dict[str, Any]) -> float:
         v for v in metrics.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
     ]
     return sum(numeric_values) / max(1, len(numeric_values)) if numeric_values else 0.0
+
+
+class FeatureStats(TypedDict):
+    """Per-feature-dimension accumulator used for MAP-Elites bin scaling.
+
+    ``min``/``max`` are scalars that bound the observed range, while ``values``
+    keeps the most recent samples for percentile scaling. Keeping the record
+    explicit (instead of ``Dict[str, Union[float, List[float]]]``) means the
+    scalar fields and the sample list stay distinguishable.
+    """
+
+    min: float
+    max: float
+    values: List[float]
 
 
 @dataclass
@@ -191,7 +207,7 @@ class ProgramDatabase:
             self.load(config.db_path)
 
         # Prompt log
-        self.prompts_by_program: Dict[str, Dict[str, Dict[str, str]]] = None
+        self.prompts_by_program: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None
 
         # Set random seed for reproducible sampling if specified
         if config.random_seed is not None:
@@ -211,7 +227,7 @@ class ProgramDatabase:
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
         # Feature scaling infrastructure
-        self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
+        self.feature_stats: Dict[str, FeatureStats] = {}
         self.feature_scaling_method: str = "minmax"  # Options: minmax, zscore, percentile
 
         # Per-dimension bins support
@@ -268,7 +284,7 @@ class ProgramDatabase:
         )
 
     def add(
-        self, program: Program, iteration: int = None, target_island: Optional[int] = None
+        self, program: Program, iteration: Optional[int] = None, target_island: Optional[int] = None
     ) -> Optional[str]:
         """
         Add a program to the database
@@ -330,7 +346,7 @@ class ProgramDatabase:
             raise
 
     def _add(
-        self, program: Program, iteration: int = None, target_island: Optional[int] = None
+        self, program: Program, iteration: Optional[int] = None, target_island: Optional[int] = None
     ) -> Optional[str]:
         # Determine target island
         # If target_island is not specified and program has a parent, inherit parent's island
@@ -746,7 +762,7 @@ class ProgramDatabase:
             os.makedirs(programs_dir, exist_ok=True)
 
         # Neither of these can change while the loop runs
-        prompts_by_program = self.prompts_by_program
+        prompts_by_program = self.prompts_by_program or {}
         log_prompts = self.config.log_prompts and bool(prompts_by_program)
 
         # Save each program
@@ -1138,6 +1154,12 @@ class ProgramDatabase:
         import asyncio
         from openevolve.novelty_judge import NOVELTY_SYSTEM_MSG, NOVELTY_USER_MSG
 
+        if self.novelty_llm is None:
+            # Without a judge model there is no way to reject a similar program,
+            # so accept it (this is the case in parallel worker processes).
+            logger.debug("Novelty judge LLM is not configured, accepting program as novel")
+            return True
+
         user_msg = NOVELTY_USER_MSG.format(
             language=program.language,
             existing_code=similar_program.code,
@@ -1162,7 +1184,7 @@ class ProgramDatabase:
                     content: str = future.result()
             except RuntimeError:
                 # No event loop running, safe to use asyncio.run()
-                content: str = asyncio.run(
+                content = asyncio.run(
                     self.novelty_llm.generate_with_context(
                         system_message=NOVELTY_SYSTEM_MSG,
                         messages=[{"role": "user", "content": user_msg}],
@@ -1199,12 +1221,12 @@ class ProgramDatabase:
 
         return True
 
-    def _is_novel(self, program_id: int, island_idx: int) -> bool:
+    def _is_novel(self, program_id: str, island_idx: int) -> bool:
         """
         Determine if a program is novel based on diversity to existing programs
 
         Args:
-            program: Program to check
+            program_id: ID of the program to check
             island_idx: Island index
 
         Returns:
@@ -1215,7 +1237,9 @@ class ProgramDatabase:
             return True
 
         program = self.programs[program_id]
-        embd = self.embedding_client.get_embedding(program.code)
+        # `get_embedding` is annotated as a union because it also accepts a list of
+        # codes; a single code string always yields a single embedding vector.
+        embd = cast(List[float], self.embedding_client.get_embedding(program.code))
         self.programs[program_id].embedding = embd
 
         max_smlty = float("-inf")
@@ -1642,10 +1666,10 @@ class ProgramDatabase:
                     weights = [1.0 / len(island_program_objects)] * len(island_program_objects)
 
                 # Sample parent based on weights
-                parent = random.choices(island_program_objects, weights=weights, k=1)[0]
-                parent_id = parent.id
+                sampled_parent = random.choices(island_program_objects, weights=weights, k=1)[0]
+                parent_id = sampled_parent.id
 
-        parent = self.programs.get(parent_id)
+        parent: Optional[Program] = self.programs.get(parent_id)
         if not parent:
             # Should not happen, but handle gracefully
             logger.error(f"Parent program {parent_id} not found in database")
@@ -1796,7 +1820,7 @@ class ProgramDatabase:
 
             # Try to sample from different feature cells within the island
             feature_coords = self._calculate_feature_coords(parent)
-            nearby_programs = []
+            nearby_programs: List[Program] = []
 
             # Create a mapping of feature cells to island programs for efficient lookup
             island_feature_map = {}
@@ -1928,7 +1952,7 @@ class ProgramDatabase:
             f"Population size ({population_count}) exceeds limit ({self.config.population_size}), removing {num_to_remove} programs"
         )
 
-        protected_ids = {best_id, exclude_program_id} - {None}
+        protected_ids = {pid for pid in (best_id, exclude_program_id) if pid is not None}
 
         all_programs = list(self.programs.values())
 
@@ -1952,7 +1976,7 @@ class ProgramDatabase:
             programs_to_remove = [self.programs[pid] for pid in chosen_ids]
         else:
             # Preserve MAP-Elites cell owners until non-owning programs are exhausted.
-            elite_ids = set()
+            elite_ids: Set[str] = set()
             for island_map in self.island_feature_maps:
                 elite_ids.update(island_map.values())
             non_elite = sorted(
@@ -2260,7 +2284,7 @@ class ProgramDatabase:
         if len(programs) < 2:
             return 0.0
 
-        total_diversity = 0
+        total_diversity = 0.0
         comparisons = 0
 
         # Use deterministic sampling instead of random.sample() to ensure consistent results
@@ -2377,7 +2401,7 @@ class ProgramDatabase:
 
             # Greedily add programs that maximize diversity to selected set
             while len(selected) < self.diversity_reference_size and remaining:
-                max_diversity = -1
+                max_diversity = -1.0
                 best_idx = -1
 
                 for i, candidate in enumerate(remaining):
@@ -2506,10 +2530,10 @@ class ProgramDatabase:
         Returns:
             Dictionary that can be JSON-serialized
         """
-        serialized = {}
+        serialized: Dict[str, Any] = {}
         for feature_name, stats in self.feature_stats.items():
             # Convert to JSON-serializable format
-            serialized_stats = {}
+            serialized_stats: Dict[str, Any] = {}
             for key, value in stats.items():
                 if key == "values":
                     # Limit size to prevent excessive memory usage
@@ -2527,9 +2551,7 @@ class ProgramDatabase:
             serialized[feature_name] = serialized_stats
         return serialized
 
-    def _deserialize_feature_stats(
-        self, stats_dict: Dict[str, Any]
-    ) -> Dict[str, Dict[str, Union[float, List[float]]]]:
+    def _deserialize_feature_stats(self, stats_dict: Dict[str, Any]) -> Dict[str, FeatureStats]:
         """
         Deserialize feature_stats from loaded JSON
 
@@ -2542,11 +2564,11 @@ class ProgramDatabase:
         if not stats_dict:
             return {}
 
-        deserialized = {}
+        deserialized: Dict[str, FeatureStats] = {}
         for feature_name, stats in stats_dict.items():
             if isinstance(stats, dict):
                 # Ensure proper structure and types
-                deserialized_stats = {
+                deserialized_stats: FeatureStats = {
                     "min": float(stats.get("min", 0.0)),
                     "max": float(stats.get("max", 1.0)),
                     "values": list(stats.get("values", [])),
@@ -2667,13 +2689,13 @@ class ProgramDatabase:
         else:
             return len(str(value).encode("utf-8"))
 
-    def _artifact_serializer(self, obj):
+    def _artifact_serializer(self, obj: Any) -> Any:
         """JSON serializer for artifacts that handles bytes"""
         if isinstance(obj, bytes):
             return {"__bytes__": base64.b64encode(obj).decode("utf-8")}
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-    def _artifact_deserializer(self, dct):
+    def _artifact_deserializer(self, dct: Dict[str, Any]) -> Any:
         """JSON deserializer for artifacts that handles bytes"""
         if "__bytes__" in dct:
             return base64.b64decode(dct["__bytes__"])
@@ -2758,7 +2780,7 @@ class ProgramDatabase:
 
     def _load_artifact_dir(self, artifact_dir: str) -> Dict[str, Union[str, bytes]]:
         """Load artifacts from a directory"""
-        artifacts = {}
+        artifacts: Dict[str, Union[str, bytes]] = {}
 
         try:
             for filename in os.listdir(artifact_dir):
@@ -2772,8 +2794,8 @@ class ProgramDatabase:
                     except UnicodeDecodeError:
                         # If text fails, read as binary
                         with open(file_path, "rb") as f:
-                            content = f.read()
-                        artifacts[filename] = content
+                            binary_content = f.read()
+                        artifacts[filename] = binary_content
                     except Exception as e:
                         logger.warning(f"Failed to read artifact file {file_path}: {e}")
         except Exception as e:

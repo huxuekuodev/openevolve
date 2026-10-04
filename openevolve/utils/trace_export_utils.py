@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TextIO, Union
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +30,11 @@ def export_traces_jsonl(
 
         if not output_path.suffix == ".gz":
             output_path = output_path.with_suffix(output_path.suffix + ".gz")
-        open_func = gzip.open
-        mode = "wt"
+        handle: TextIO = gzip.open(output_path, "wt")
     else:
-        open_func = open
-        mode = "w"
+        handle = open(output_path, "w")
 
-    with open_func(output_path, mode) as f:
+    with handle as f:
         for trace in traces:
             trace_dict = trace.to_dict() if hasattr(trace, "to_dict") else trace
             json.dump(trace_dict, f)
@@ -68,11 +66,12 @@ def export_traces_json(
             trace_dicts.append(trace)
 
     # Build output structure
-    output_data = {"metadata": metadata or {}, "traces": trace_dicts}
+    output_metadata: Dict[str, Any] = metadata or {}
+    output_data = {"metadata": output_metadata, "traces": trace_dicts}
 
     # Add default metadata
-    output_data["metadata"].setdefault("total_traces", len(trace_dicts))
-    output_data["metadata"].setdefault("exported_at", time.time())
+    output_metadata.setdefault("total_traces", len(trace_dicts))
+    output_metadata.setdefault("exported_at", time.time())
 
     with open(output_path, "w") as f:
         json.dump(output_data, f, indent=2)
@@ -166,15 +165,13 @@ def append_trace_jsonl(trace: Any, output_path: Union[str, Path], compress: bool
 
         if not output_path.suffix == ".gz":
             output_path = output_path.with_suffix(output_path.suffix + ".gz")
-        open_func = gzip.open
-        mode = "at"
+        handle: TextIO = gzip.open(output_path, "at")
     else:
-        open_func = open
-        mode = "a"
+        handle = open(output_path, "a")
 
     trace_dict = trace.to_dict() if hasattr(trace, "to_dict") else trace
 
-    with open_func(output_path, mode) as f:
+    with handle as f:
         json.dump(trace_dict, f)
         f.write("\n")
 
@@ -195,14 +192,12 @@ def load_traces_jsonl(input_path: Union[str, Path], compress: bool = False) -> L
     if compress or input_path.suffix == ".gz":
         import gzip
 
-        open_func = gzip.open
-        mode = "rt"
+        reader: TextIO = gzip.open(input_path, "rt")
     else:
-        open_func = open
-        mode = "r"
+        reader = open(input_path, "r")
 
     traces = []
-    with open_func(input_path, mode) as f:
+    with reader as f:
         for line in f:
             if line.strip():
                 traces.append(json.loads(line))

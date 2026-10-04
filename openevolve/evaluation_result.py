@@ -4,7 +4,7 @@ Evaluation result structures for OpenEvolve
 
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Union
+from typing import Any, Dict, List
 
 
 @dataclass
@@ -25,7 +25,13 @@ class EvaluationResult:
     """
 
     metrics: Dict[str, float]  # mandatory - existing contract
-    artifacts: Dict[str, Union[str, bytes]] = field(default_factory=dict)  # optional side-channel
+    # Arbitrary JSON-serialisable side-channel. Narrowing this to ``str | bytes``
+    # was wrong: the evaluator itself stores flags and counters here
+    # ({"failure_stage": "stage1", "timeout": True, "timeout_duration": 3}), and
+    # custom evaluators store structured data. ``get_artifact_size`` below
+    # already has a fallback branch for non-str/bytes values, and the database
+    # JSON-serialises artifacts, so arbitrary values are supported by design.
+    artifacts: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, metrics: Dict[str, float]) -> "EvaluationResult":
@@ -40,7 +46,7 @@ class EvaluationResult:
         """Check if this result contains any artifacts"""
         return bool(self.artifacts)
 
-    def get_artifact_keys(self) -> list:
+    def get_artifact_keys(self) -> List[str]:
         """Get list of artifact keys"""
         return list(self.artifacts.keys())
 

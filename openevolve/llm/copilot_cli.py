@@ -28,8 +28,9 @@ and are therefore ignored by this backend.
 import asyncio
 import logging
 import subprocess
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from openevolve.config import LLMModelConfig
 from openevolve.llm.base import LLMInterface
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ class CopilotCLILLM(LLMInterface):
     (run `copilot login` first).
     """
 
-    def __init__(self, model_cfg=None):
+    def __init__(self, model_cfg: Optional[LLMModelConfig] = None) -> None:
         self.model = _cfg_value(model_cfg, "name", "auto")
         self.system_message = getattr(model_cfg, "system_message", None)
         self.timeout = _cfg_value(model_cfg, "timeout", 300)
@@ -62,7 +63,7 @@ class CopilotCLILLM(LLMInterface):
         self.cwd = getattr(model_cfg, "cwd", None)
         logger.info(f"Initialized CopilotCLILLM with model: {self.model}")
 
-    async def generate(self, prompt: str, **kwargs) -> str:
+    async def generate(self, prompt: str, **kwargs: Any) -> str:
         sys_msg = kwargs.pop("system_message", self.system_message) or ""
         return await self.generate_with_context(
             system_message=sys_msg,
@@ -71,7 +72,7 @@ class CopilotCLILLM(LLMInterface):
         )
 
     async def generate_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs: Any
     ) -> str:
         user_content = "\n\n".join(
             m.get("content", "") for m in messages if m.get("role") == "user"
@@ -112,7 +113,12 @@ class CopilotCLILLM(LLMInterface):
                     logger.error(f"All {retries + 1} attempts failed with error: {e}")
                     raise
 
-    def _build_command(self, system_message: str, user_content: str, **kwargs) -> List[str]:
+        # Unreachable for retries >= 0: the loop always runs at least once and its
+        # final attempt either returns or re-raises. This keeps the function total
+        # for the type checker.
+        raise RuntimeError("retry loop exited without returning a response")
+
+    def _build_command(self, system_message: str, user_content: str, **kwargs: Any) -> List[str]:
         prompt = f"{system_message}\n\n{user_content}" if system_message else user_content
 
         cmd = [
@@ -172,6 +178,6 @@ class CopilotCLILLM(LLMInterface):
         return output
 
 
-def init_copilot_cli_client(model_cfg):
+def init_copilot_cli_client(model_cfg: Optional[LLMModelConfig]) -> LLMInterface:
     """Factory function compatible with OpenEvolve's init_client config hook."""
     return CopilotCLILLM(model_cfg)

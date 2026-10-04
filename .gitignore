@@ -49,6 +49,9 @@ pr_sanity*/
 .coverage
 htmlcov/
 
+# Type checker cache (mypy also drops a self-ignoring .gitignore in here)
+.mypy_cache/
+
 # Misc
 .DS_Store
 .venv

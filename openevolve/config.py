@@ -52,9 +52,9 @@ class LLMModelConfig:
     """Configuration for a single LLM model"""
 
     # API configuration
-    api_base: str = None
+    api_base: Optional[str] = None
     api_key: Optional[str] = None
-    name: str = None
+    name: Optional[str] = None
 
     # LLM provider: "openai" (default), "claude_code" (Claude Code CLI)
     # Also supports "copilot_cli" (GitHub Copilot CLI)
@@ -70,12 +70,12 @@ class LLMModelConfig:
     system_message: Optional[str] = None
     temperature: float | None = None
     top_p: float | None = None
-    max_tokens: int = None
+    max_tokens: Optional[int] = None
 
     # Request parameters
-    timeout: int = None
-    retries: int = None
-    retry_delay: int = None
+    timeout: Optional[int] = None
+    retries: Optional[int] = None
+    retry_delay: Optional[int] = None
 
     # Reproducibility
     random_seed: Optional[int] = None
@@ -96,7 +96,7 @@ class LLMModelConfig:
     manual_mode: Optional[bool] = None
     _manual_queue_dir: Optional[str] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Post-initialization to resolve ${VAR} env var references in api_key"""
         self.api_key = _resolve_env_var(self.api_key)
 
@@ -126,10 +126,10 @@ class LLMConfig(LLMModelConfig):
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
 
     # Backwardes compatibility with primary_model(_weight) options
-    primary_model: str = None
-    primary_model_weight: float = None
-    secondary_model: str = None
-    secondary_model_weight: float = None
+    primary_model: Optional[str] = None
+    primary_model_weight: Optional[float] = None
+    secondary_model: Optional[str] = None
+    secondary_model_weight: Optional[float] = None
 
     # Reasoning parameters (inherited from LLMModelConfig but can be overridden)
     reasoning_effort: Optional[str] = None
@@ -137,7 +137,7 @@ class LLMConfig(LLMModelConfig):
     # Manual mode switch
     manual_mode: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Post-initialization to set up model configurations"""
         super().__post_init__()  # Resolve ${VAR} in api_key at LLMConfig level
 
@@ -433,7 +433,7 @@ class Config:
     log_level: str = "INFO"
     log_dir: Optional[str] = None
     random_seed: Optional[int] = 42
-    language: str = None
+    language: Optional[str] = None
     file_suffix: str = ".py"
 
     # Component configurations
@@ -490,11 +490,15 @@ class Config:
             if "top_p" in config_dict["llm"] and config_dict["llm"]["top_p"] is None:
                 del config_dict["llm"]["top_p"]
 
+        # dacite wants concrete classes here, but `Union` is a typing special form
+        # rather than a class, so the list is inherently heterogeneous and can only
+        # be typed as `List[Any]`.
+        cast_targets: List[Any] = [List, Union]
         config: Config = dacite.from_dict(
             data_class=cls,
             data=config_dict,
             config=dacite.Config(
-                cast=[List, Union],
+                cast=cast_targets,
                 forward_references={"LLMInterface": Any},
             ),
         )

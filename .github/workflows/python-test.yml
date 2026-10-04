@@ -3,6 +3,32 @@ name: Tests
 on: [push, pull_request]
 
 jobs:
+  # Fast gate for the type annotations. Runs on its own so a type error is
+  # reported without waiting for the (much slower) test suite.
+  #
+  # NOTE: this job deliberately does not run `make format-check`. The repo has
+  # pre-existing black/isort drift (40 files at the time mypy was made clean),
+  # so a formatting gate would fail immediately. Run `make format` in a
+  # dedicated formatting-only PR and then add `make format-check` here.
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Type check with mypy
+        run: python -m mypy
+
   unit-tests:
     runs-on: ubuntu-latest
     steps:
@@ -27,13 +53,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Run unit tests
+      - name: Run unit tests with coverage
         env:
           OPENAI_API_KEY: test  # Mock API key for unit tests
         run: |
-          # Run unit tests (all tests except integration/)
-          python -m unittest discover -s tests -p "test_*.py" -v
-          
+          # pytest runs the whole unittest-style suite plus the plain-function
+          # tests, and gives markers/coverage. tests/integration/ is excluded
+          # here and exercised in its own job against a real model server.
+          python -m pytest tests --ignore=tests/integration \
+            --cov=openevolve --cov-report=term-missing --cov-report=xml -v
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
   integration-tests:
     needs: unit-tests  # Only run if unit tests pass
     runs-on: ubuntu-latest
@@ -111,11 +148,14 @@ jobs:
           OPENAI_API_KEY: optillm
           OPTILLM_API_KEY: optillm
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # The server is up and healthy at this point, so an unavailable server
+          # must fail the job rather than skip the suite and report green.
+          OPENEVOLVE_REQUIRE_LLM_SERVER: "1"
         run: |
           # Run the ENTIRE integration suite against the local dhara model server.
           # Slow real-LLM tests are intentionally NOT skipped so contributor PRs are
           # exercised end-to-end (evolution loop, checkpoints, migration, library API).
-          pytest tests/integration -v --tb=short
+          python -m pytest tests/integration -v --tb=short
           
       - name: Stop optillm server
         if: always()

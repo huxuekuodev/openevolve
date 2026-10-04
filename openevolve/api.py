@@ -16,6 +16,7 @@ from openevolve.config import Config, load_config, LLMModelConfig
 from openevolve.database import Program
 from openevolve.population import PopulationStrategy
 from openevolve.selection import IslandSelector
+from openevolve.utils.metrics_utils import safe_numeric_average
 
 
 @dataclass
@@ -28,7 +29,7 @@ class EvolutionResult:
     metrics: Dict[str, Any]
     output_dir: Optional[str]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"EvolutionResult(best_score={self.best_score:.4f})"
 
 
@@ -130,7 +131,7 @@ async def _run_evolution_async(
     """Async implementation of run_evolution"""
 
     temp_dir = None
-    temp_files = []
+    temp_files: List[str] = []
 
     try:
         # Handle configuration
@@ -183,7 +184,9 @@ async def _run_evolution_async(
             population_strategy=population_strategy,
         )
 
-        best_program = await controller.run(iterations=iterations,target_score=target_score,checkpoint_path=checkpoint_path)
+        best_program = await controller.run(
+            iterations=iterations, target_score=target_score, checkpoint_path=checkpoint_path
+        )
 
         # Prepare result
         best_score = 0.0
@@ -197,9 +200,12 @@ async def _run_evolution_async(
             if "combined_score" in metrics:
                 best_score = metrics["combined_score"]
             elif metrics:
-                numeric_metrics = [v for v in metrics.values() if isinstance(v, (int, float))]
-                if numeric_metrics:
-                    best_score = sum(numeric_metrics) / len(numeric_metrics)
+                # Use the shared helper rather than an ad-hoc average: `bool` is a
+                # subclass of `int`, so a plain isinstance check counts flags such
+                # as `timeout: True` as a 1.0 score. The evaluator itself emits
+                # `{"error": 0.0, "timeout": True}` on a timeout, which would hand
+                # a failed program a mid-range best_score of 0.5 instead of 0.0.
+                best_score = safe_numeric_average(metrics)
 
         return EvolutionResult(
             best_program=best_program,
@@ -396,7 +402,7 @@ def evaluate(program_path):
 
 
 def evolve_function(
-    func: Callable, test_cases: List[Tuple[Any, Any]], iterations: int = 100, **kwargs
+    func: Callable, test_cases: List[Tuple[Any, Any]], iterations: int = 100, **kwargs: Any
 ) -> EvolutionResult:
     """
     Evolve a Python function based on test cases
@@ -518,7 +524,7 @@ def evaluate(program_path):
 
 
 def evolve_algorithm(
-    algorithm_class: type, benchmark: Callable, iterations: int = 100, **kwargs
+    algorithm_class: type, benchmark: Callable, iterations: int = 100, **kwargs: Any
 ) -> EvolutionResult:
     """
     Evolve an algorithm class based on a benchmark
@@ -624,7 +630,10 @@ def evaluate(program_path):
 
 
 def evolve_code(
-    initial_code: str, evaluator: Callable[[str], Dict[str, Any]], iterations: int = 100, **kwargs
+    initial_code: str,
+    evaluator: Callable[[str], Dict[str, Any]],
+    iterations: int = 100,
+    **kwargs: Any,
 ) -> EvolutionResult:
     """
     Evolve arbitrary code with a custom evaluator

@@ -56,7 +56,9 @@ def safe_numeric_sum(metrics: Dict[str, Any]) -> float:
 
     numeric_sum = 0.0
     for value in metrics.values():
-        if isinstance(value, (int, float)):
+        # Keep this in step with `safe_numeric_average`: a boolean flag is not a
+        # score, so summing `{"error": 0.0, "timeout": True}` must not add 1.0.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
             try:
                 # Convert to float and check if it's a valid number
                 float_val = float(value)

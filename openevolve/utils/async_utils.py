@@ -6,7 +6,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ async def retry_async(
     retries: int = 3,
     delay: float = 1.0,
     backoff: float = 2.0,
-    exceptions: Union[Exception, tuple] = Exception,
+    exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception,
     **kwargs: Any,
 ) -> Any:
     """

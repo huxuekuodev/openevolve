@@ -5,7 +5,7 @@ Model ensemble for LLMs
 import asyncio
 import logging
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 from openevolve.llm.base import LLMInterface
 from openevolve.llm.openai import OpenAILLM
@@ -13,12 +13,19 @@ from openevolve.config import LLMModelConfig
 
 logger = logging.getLogger(__name__)
 
-_PROVIDER_REGISTRY = {
+# Whether the "Initialized LLM ensemble with models: ..." line has already been
+# emitted. This is process-local state, so it lives at module scope rather than
+# being stapled onto the shared `Logger` object (which is a singleton and would
+# leak state across modules).
+_ensemble_logged = False
+
+_PROVIDER_REGISTRY: Dict[str, Callable[[LLMModelConfig], LLMInterface]] = {
     "openai": lambda cfg: OpenAILLM(cfg),
 }
 
 try:
     from openevolve.llm.claude_code import ClaudeCodeLLM
+
     _PROVIDER_REGISTRY["claude_code"] = lambda cfg: ClaudeCodeLLM(cfg)
 except ImportError:
     pass
@@ -33,17 +40,27 @@ except ImportError:
 
 def _create_model(model_cfg: LLMModelConfig) -> LLMInterface:
     if model_cfg.init_client:
-        return model_cfg.init_client(model_cfg)
+        # `init_client` is a user-supplied hook typed as a bare `Callable`, so its
+        # return value is `Any`; the factory contract is to hand back an LLM.
+        return cast(LLMInterface, model_cfg.init_client(model_cfg))
     provider = getattr(model_cfg, "provider", None)
     if provider and provider in _PROVIDER_REGISTRY:
         return _PROVIDER_REGISTRY[provider](model_cfg)
     return OpenAILLM(model_cfg)
 
 
-class LLMEnsemble:
-    """Ensemble of LLMs"""
+class LLMEnsemble(LLMInterface):
+    """
+    Ensemble of LLMs.
 
-    def __init__(self, models_cfg: List[LLMModelConfig]):
+    Subclasses ``LLMInterface`` because it is used as one: the controller hands
+    it to ``DatabaseConfig.novelty_llm``, which is typed ``Optional[LLMInterface]``
+    and only ever calls ``generate_with_context``. Declaring the relationship
+    (rather than relying on structural coincidence) keeps that assignment
+    honest and makes ``isinstance`` checks meaningful.
+    """
+
+    def __init__(self, models_cfg: List[LLMModelConfig]) -> None:
         self.models_cfg = models_cfg
 
         # Initialize models from the configuration
@@ -67,8 +84,10 @@ class LLMEnsemble:
                 f"LLMEnsemble: Set random seed to {models_cfg[0].random_seed} for deterministic model selection"
             )
 
+        global _ensemble_logged
+
         # Only log if we have multiple models or this is the first ensemble
-        if len(models_cfg) > 1 or not hasattr(logger, "_ensemble_logged"):
+        if len(models_cfg) > 1 or not _ensemble_logged:
             logger.info(
                 f"Initialized LLM ensemble with models: "
                 + ", ".join(
@@ -76,11 +95,11 @@ class LLMEnsemble:
                     for model, weight in zip(models_cfg, self.weights)
                 )
             )
-            logger._ensemble_logged = True
+            _ensemble_logged = True
 
         self.last_usage: Optional[Dict[str, Any]] = None
 
-    async def generate(self, prompt: str, **kwargs) -> str:
+    async def generate(self, prompt: str, **kwargs: Any) -> str:
         """Generate text using a randomly selected model based on weights"""
         model = self._sample_model()
         res = await model.generate(prompt, **kwargs)
@@ -88,7 +107,7 @@ class LLMEnsemble:
         return res
 
     async def generate_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs: Any
     ) -> str:
         """Generate text using a system message and conversational context"""
         model = self._sample_model()
@@ -103,19 +122,19 @@ class LLMEnsemble:
         logger.info(f"Sampled model: {vars(sampled_model)['model']}")
         return sampled_model
 
-    async def generate_multiple(self, prompt: str, n: int, **kwargs) -> List[str]:
+    async def generate_multiple(self, prompt: str, n: int, **kwargs: Any) -> List[str]:
         """Generate multiple texts in parallel"""
         tasks = [self.generate(prompt, **kwargs) for _ in range(n)]
         return await asyncio.gather(*tasks)
 
-    async def parallel_generate(self, prompts: List[str], **kwargs) -> List[str]:
+    async def parallel_generate(self, prompts: List[str], **kwargs: Any) -> List[str]:
         """Generate responses for multiple prompts in parallel"""
         tasks = [self.generate(prompt, **kwargs) for prompt in prompts]
         return await asyncio.gather(*tasks)
 
     async def generate_all_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
-    ) -> str:
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs: Any
+    ) -> List[str]:
         """Generate text using a all available models and average their returned metrics"""
         responses = []
         for model in self.models:

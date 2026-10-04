@@ -13,14 +13,36 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
 from openevolve.selection import IslandSelectionContext, IslandSelector, IslandState
 from openevolve.utils.metrics_utils import safe_numeric_average
 
+if TYPE_CHECKING:
+    from openevolve.evaluator import Evaluator
+    from openevolve.evolution_trace import EvolutionTracer
+    from openevolve.llm.ensemble import LLMEnsemble
+    from openevolve.prompt.sampler import PromptSampler
+
 logger = logging.getLogger(__name__)
+
+# Per-process worker state, populated by `_worker_init` (registered as the
+# ProcessPoolExecutor `initializer`, see `start()` below) at the start of every
+# spawned worker process. Declared here as bare annotations so the types are
+# visible to the type checker without importing the heavy evaluator / LLM /
+# prompt stack at module import time; the quotes keep the annotations from being
+# evaluated at runtime.
+#
+# These names are only meaningful inside a worker process, and only after
+# `_worker_init` has run. The three lazily-built components are Optional because
+# `_lazy_init_worker_components` is what populates them on first use.
+_worker_config: "Config"
+_worker_evaluation_file: str
+_worker_evaluator: "Optional[Evaluator]"
+_worker_llm_ensemble: "Optional[LLMEnsemble]"
+_worker_prompt_sampler: "Optional[PromptSampler]"
 
 
 class _CandidateRejected(Exception):
@@ -43,7 +65,9 @@ class SerializableResult:
     token_usage: Optional[Dict[str, Any]] = None
 
 
-def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
+def _worker_init(
+    config_dict: dict, evaluation_file: str, parent_env: Optional[Dict[str, str]] = None
+) -> None:
     """Initialize worker process with necessary components"""
     import os
 
@@ -102,7 +126,7 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     _worker_prompt_sampler = None
 
 
-def _lazy_init_worker_components():
+def _lazy_init_worker_components() -> None:
     """Lazily initialize expensive components on first use"""
     global _worker_evaluator
     global _worker_llm_ensemble
@@ -146,6 +170,22 @@ def _run_iteration_worker(
         # Lazy initialization
         _lazy_init_worker_components()
 
+        # Bind the lazily-built components to locals so the "initialised by now"
+        # invariant is checked once (and the type checker can see through it)
+        # instead of being re-asserted at every use. Only the components used on
+        # every path are bound here: `_worker_evaluator` is resolved just before
+        # it is needed, so the early exits below keep working in contexts where
+        # no evaluator was ever created (as the worker unit tests rely on).
+        llm_ensemble = _worker_llm_ensemble
+        prompt_sampler = _worker_prompt_sampler
+        if llm_ensemble is None or prompt_sampler is None:
+            raise RuntimeError("worker components were not initialised")
+
+        # `Config.language` is Optional and normally filled in by the controller
+        # from the initial program's file extension. Fall back to the same
+        # default the prompt sampler, Program and code parser already use.
+        language = _worker_config.language or "python"
+
         # Reconstruct programs from snapshot
         programs = {pid: Program(**prog_dict) for pid, prog_dict in db_snapshot["programs"].items()}
 
@@ -185,14 +225,14 @@ def _run_iteration_worker(
             parent_changes_desc = None
             child_changes_desc = None
 
-        prompt = _worker_prompt_sampler.build_prompt(
+        prompt = prompt_sampler.build_prompt(
             current_program=parent.code,
             parent_program=parent.code,
             program_metrics=parent.metrics,
             previous_programs=[p.to_dict() for p in best_programs_only],
             top_programs=[p.to_dict() for p in programs_for_prompt],
             inspirations=[p.to_dict() for p in inspirations],
-            language=_worker_config.language,
+            language=language,
             evolution_round=iteration,
             diff_based_evolution=_worker_config.diff_based_evolution,
             program_artifacts=parent_artifacts,
@@ -206,12 +246,12 @@ def _run_iteration_worker(
         # Generate code modification (sync wrapper for async)
         try:
             llm_response = asyncio.run(
-                _worker_llm_ensemble.generate_with_context(
+                llm_ensemble.generate_with_context(
                     system_message=prompt["system"],
                     messages=[{"role": "user", "content": prompt["user"]}],
                 )
             )
-            token_usage = getattr(_worker_llm_ensemble, "last_usage", None)
+            token_usage = getattr(llm_ensemble, "last_usage", None)
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
@@ -245,11 +285,16 @@ def _run_iteration_worker(
                 )
 
             if _worker_config.prompt.programs_as_changes_description:
+                # Both descriptions are non-None under this flag (they were set
+                # in the prompt-building branch above); coerce once here so the
+                # invariant is explicit rather than implicit in a repeated
+                # config lookup.
+                parent_desc_text = parent_changes_desc or ""
                 try:
                     code_blocks, desc_blocks, _unmatched = split_diffs_by_target(
                         diff_blocks,
                         code_text=parent.code,
-                        changes_description_text=parent_changes_desc,
+                        changes_description_text=parent_desc_text,
                     )
                 except Exception as e:
                     return SerializableResult(
@@ -257,15 +302,13 @@ def _run_iteration_worker(
                     )
 
                 child_code, _ = apply_diff_blocks(parent.code, code_blocks)
-                child_changes_desc, desc_applied = apply_diff_blocks(
-                    parent_changes_desc, desc_blocks
-                )
+                child_changes_desc, desc_applied = apply_diff_blocks(parent_desc_text, desc_blocks)
 
                 # Must update the previous changes description
                 if (
                     desc_applied == 0
                     or not child_changes_desc.strip()
-                    or child_changes_desc.strip() == parent_changes_desc.strip()
+                    or child_changes_desc.strip() == parent_desc_text.strip()
                 ):
                     return SerializableResult(
                         error="changes_description was not updated or empty, program is discarded",
@@ -309,7 +352,7 @@ def _run_iteration_worker(
         else:
             from openevolve.utils.code_utils import parse_full_rewrite
 
-            new_code = parse_full_rewrite(llm_response, _worker_config.language)
+            new_code = parse_full_rewrite(llm_response, language)
             if not new_code:
                 return SerializableResult(
                     error=f"No valid code found in response",
@@ -360,18 +403,22 @@ def _run_iteration_worker(
         # Evaluate the child program
         import uuid
 
+        evaluator = _worker_evaluator
+        if evaluator is None:
+            raise RuntimeError("worker evaluator was not initialised")
+
         child_id = str(uuid.uuid4())
-        child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
+        child_metrics = asyncio.run(evaluator.evaluate_program(child_code, child_id))
 
         # Get artifacts
-        artifacts = _worker_evaluator.get_pending_artifacts(child_id)
+        artifacts = evaluator.get_pending_artifacts(child_id)
 
         # Create child program
         child_program = Program(
             id=child_id,
             code=child_code,
-            changes_description=child_changes_desc,
-            language=_worker_config.language,
+            changes_description=child_changes_desc or "",
+            language=language,
             parent_id=parent.id,
             generation=parent.generation + 1,
             metrics=child_metrics,
@@ -469,10 +516,10 @@ class ProcessParallelController:
         config: Config,
         evaluation_file: str,
         database: ProgramDatabase,
-        evolution_tracer=None,
+        evolution_tracer: Optional["EvolutionTracer"] = None,
         file_suffix: str = ".py",
         island_selector: Optional[IslandSelector] = None,
-    ):
+    ) -> None:
         self.config = config
         self.evaluation_file = evaluation_file
         self.database = database
@@ -536,7 +583,9 @@ class ProcessParallelController:
 
         current_env = dict(os.environ)
 
-        executor_kwargs = {
+        # Built up incrementally across the Python-version branches below, so the
+        # value type is genuinely heterogeneous (int, callable, tuple, context).
+        executor_kwargs: Dict[str, Any] = {
             "max_workers": self.num_workers,
             "initializer": _worker_init,
             "initargs": (config_dict, self.evaluation_file, current_env),
@@ -574,7 +623,7 @@ class ProcessParallelController:
     def _create_database_snapshot(self) -> Dict[str, Any]:
         """Create a serializable snapshot of the database state"""
         # Only include necessary data for workers
-        snapshot = {
+        snapshot: Dict[str, Any] = {
             "programs": {pid: prog.to_dict() for pid, prog in self.database.programs.items()},
             "islands": [list(island) for island in self.database.islands],
             "current_island": self.database.current_island,
@@ -603,6 +652,9 @@ class ProcessParallelController:
 
     def _select_island(self, iteration: int, island_pending: Dict[int, List[int]]) -> int:
         """Ask a custom policy for an island using a read-only state snapshot."""
+        selector = self.island_selector
+        if selector is None:
+            raise RuntimeError("_select_island called without a configured island_selector")
         stats = self.database.get_island_stats()
         context = IslandSelectionContext(
             iteration=iteration,
@@ -618,19 +670,25 @@ class ProcessParallelController:
                 for stat in stats
             ),
         )
-        island_id = self.island_selector(context)
-        if (
-            isinstance(island_id, bool)
-            or not isinstance(island_id, Integral)
-            or not 0 <= island_id < self.num_islands
-        ):
-            raise ValueError(
-                f"island_selector must return an integer island ID in [0, {self.num_islands - 1}], "
-                f"got {island_id!r}"
-            )
-        return int(island_id)
+        island_id = selector(context)
+        # `island_id` is the policy's raw return value, so it is untrusted: a
+        # bool is rejected explicitly because `bool` is a subclass of `int`, and
+        # the range check is done on the coerced int because `Integral` itself
+        # is not ordered against `int`.
+        invalid = (
+            f"island_selector must return an integer island ID in [0, {self.num_islands - 1}], "
+            f"got {island_id!r}"
+        )
+        if isinstance(island_id, bool) or not isinstance(island_id, Integral):
+            raise ValueError(invalid)
+        resolved_island_id = int(island_id)
+        if not 0 <= resolved_island_id < self.num_islands:
+            raise ValueError(invalid)
+        return resolved_island_id
 
-    def _checkpoint_if_due(self, iteration: int, callback=None) -> None:
+    def _checkpoint_if_due(
+        self, iteration: int, callback: Optional[Callable[[int], None]] = None
+    ) -> None:
         if iteration > 0 and iteration % self.config.checkpoint_interval == 0:
             logger.info("Checkpoint interval reached at iteration %d", iteration)
             self.database.log_island_status()
@@ -642,8 +700,8 @@ class ProcessParallelController:
         start_iteration: int,
         max_iterations: int,
         target_score: Optional[float] = None,
-        checkpoint_callback=None,
-    ):
+        checkpoint_callback: Optional[Callable[[int], None]] = None,
+    ) -> Optional[Program]:
         """Run evolution with process-based parallelism"""
         if not self.executor:
             raise RuntimeError("Process pool not started")
@@ -692,19 +750,23 @@ class ProcessParallelController:
         total_tokens = 0
         total_llm_calls = 0
 
-        # Early stopping tracking
-        early_stopping_enabled = self.config.early_stopping_patience is not None
+        # Early stopping tracking. `early_stopping_patience` is Optional in the
+        # config, so read it once and derive an `int` that the comparisons below
+        # can use without re-narrowing at every use site.
+        configured_patience = self.config.early_stopping_patience
+        early_stopping_enabled = configured_patience is not None
+        patience = configured_patience if configured_patience is not None else 0
         if early_stopping_enabled:
             best_score = float("-inf")
             iterations_without_improvement = 0
-            if self.config.early_stopping_patience < 0:
+            if patience < 0:
                 logger.info(
                     f"Early stopping patience is set to a negative value, running event-based early-stopping, "
                     f"Early stop when metric '{self.config.early_stopping_metric}' reaches {self.config.convergence_threshold}"
                 )
             else:
                 logger.info(
-                    f"Early stopping enabled: patience={self.config.early_stopping_patience}, "
+                    f"Early stopping enabled: patience={patience}, "
                     f"threshold={self.config.convergence_threshold}, "
                     f"metric={self.config.early_stopping_metric}"
                 )
@@ -895,7 +957,7 @@ class ProcessParallelController:
 
                         if current_score is not None and isinstance(current_score, (int, float)):
                             # Check for improvement
-                            if self.config.early_stopping_patience > 0:
+                            if patience > 0:
                                 improvement = current_score - best_score
                                 if improvement >= self.config.convergence_threshold:
                                     best_score = current_score
@@ -906,14 +968,11 @@ class ProcessParallelController:
                                 else:
                                     iterations_without_improvement += 1
                                     logger.debug(
-                                        f"No improvement: {iterations_without_improvement}/{self.config.early_stopping_patience}"
+                                        f"No improvement: {iterations_without_improvement}/{patience}"
                                     )
 
                                 # Check if we should stop
-                                if (
-                                    iterations_without_improvement
-                                    >= self.config.early_stopping_patience
-                                ):
+                                if iterations_without_improvement >= patience:
                                     self.early_stopping_triggered = True
                                     logger.info(
                                         f"🛑 Early stopping triggered at iteration {completed_iteration}: "
@@ -1036,7 +1095,10 @@ class ProcessParallelController:
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
 
             # Submit to process pool
-            future = self.executor.submit(
+            executor = self.executor
+            if executor is None:
+                raise RuntimeError("Process pool not started")
+            future = executor.submit(
                 _run_iteration_worker,
                 iteration,
                 db_snapshot,

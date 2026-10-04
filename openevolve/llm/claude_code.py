@@ -23,11 +23,23 @@ Or inject programmatically:
 import asyncio
 import logging
 import subprocess
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+from openevolve.config import LLMModelConfig
 from openevolve.llm.base import LLMInterface
 
 logger = logging.getLogger(__name__)
+
+
+def _cfg_value(model_cfg: Any, attr: str, default: Any) -> Any:
+    """Read a config field, falling back when it is absent *or* None.
+
+    `getattr(cfg, attr, default)` is not enough here: every `LLMModelConfig` field
+    exists but defaults to None, so `getattr` would hand back None instead of the
+    fallback.
+    """
+    value = getattr(model_cfg, attr, None)
+    return default if value is None else value
 
 
 class ClaudeCodeLLM(LLMInterface):
@@ -37,19 +49,24 @@ class ClaudeCodeLLM(LLMInterface):
     (run `claude login` first).
     """
 
-    def __init__(self, model_cfg=None):
+    def __init__(self, model_cfg: Optional[LLMModelConfig] = None) -> None:
         self.model = getattr(model_cfg, "name", "sonnet")
         self.system_message = getattr(model_cfg, "system_message", None)
         self.max_tokens = getattr(model_cfg, "max_tokens", 16000)
         self.timeout = getattr(model_cfg, "timeout", 300)
         self.weight = getattr(model_cfg, "weight", 1.0)
-        self.retries = getattr(model_cfg, "retries", 3)
-        self.retry_delay = getattr(model_cfg, "retry_delay", 5)
+        # A directly-constructed `LLMModelConfig` leaves retries/retry_delay as
+        # None (only `LLMConfig` fills them in), which would make
+        # `range(retries + 1)` raise `TypeError: unsupported operand type(s)
+        # for +: 'NoneType' and 'int'` on the first call — the same defect that
+        # existed in `llm/openai.py`.
+        self.retries = _cfg_value(model_cfg, "retries", 3)
+        self.retry_delay = _cfg_value(model_cfg, "retry_delay", 5)
         self.max_budget_usd = getattr(model_cfg, "max_budget_usd", 1.0)
         self.cwd = getattr(model_cfg, "cwd", None)
         logger.info(f"Initialized ClaudeCodeLLM with model: {self.model}")
 
-    async def generate(self, prompt: str, **kwargs) -> str:
+    async def generate(self, prompt: str, **kwargs: Any) -> str:
         sys_msg = kwargs.pop("system_message", self.system_message) or ""
         return await self.generate_with_context(
             system_message=sys_msg,
@@ -58,7 +75,7 @@ class ClaudeCodeLLM(LLMInterface):
         )
 
     async def generate_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs: Any
     ) -> str:
         user_content = "\n\n".join(
             m.get("content", "") for m in messages if m.get("role") == "user"
@@ -113,6 +130,11 @@ class ClaudeCodeLLM(LLMInterface):
                     logger.error(f"All {retries + 1} attempts failed with error: {e}")
                     raise
 
+        # Unreachable for retries >= 0: the loop always runs at least once and its
+        # final attempt either returns or re-raises. This keeps the function total
+        # for the type checker.
+        raise RuntimeError("retry loop exited without returning a response")
+
     def _run_cli(self, cmd: list, timeout: int, prompt: Optional[str] = None) -> str:
         try:
             result = subprocess.run(
@@ -135,6 +157,6 @@ class ClaudeCodeLLM(LLMInterface):
             raise asyncio.TimeoutError("Claude CLI subprocess timed out")
 
 
-def init_claude_code_client(model_cfg):
+def init_claude_code_client(model_cfg: Optional[LLMModelConfig]) -> LLMInterface:
     """Factory function compatible with OpenEvolve's init_client config hook."""
     return ClaudeCodeLLM(model_cfg)

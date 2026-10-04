@@ -181,8 +181,8 @@ class TemplateManager:
         self.custom_dir = Path(custom_template_dir) if custom_template_dir else None
 
         # Load templates with cascading priority
-        self.templates = {}
-        self.fragments = {}
+        self.templates: Dict[str, str] = {}
+        self.fragments: Dict[str, str] = {}
 
         # 1. Load defaults
         self._load_from_directory(self.default_dir)
@@ -192,9 +192,7 @@ class TemplateManager:
             if self.custom_dir.exists():
                 self._load_from_directory(self.custom_dir)
             else:
-                logger.warning(
-                    f"Custom template directory does not exist, using default prompt."
-                )
+                logger.warning(f"Custom template directory does not exist, using default prompt.")
 
     def _load_from_directory(self, directory: Path) -> None:
         """Load all templates and fragments from a directory"""
@@ -220,7 +218,7 @@ class TemplateManager:
             raise ValueError(f"Template '{name}' not found")
         return self.templates[name]
 
-    def get_fragment(self, name: str, **kwargs) -> str:
+    def get_fragment(self, name: str, **kwargs: Any) -> str:
         """Get and format a fragment"""
         if name not in self.fragments:
             return f"[Missing fragment: {name}]"

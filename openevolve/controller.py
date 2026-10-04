@@ -10,7 +10,8 @@ import signal
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from types import FrameType
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from openevolve.config import Config, load_config
 from openevolve.database import Program, ProgramDatabase
@@ -147,6 +148,7 @@ class OpenEvolve:
         logger.info(f"Initialized OpenEvolve with {initial_program_path}")
 
         # Initialize evolution tracer
+        self.evolution_tracer: Optional[EvolutionTracer] = None
         if self.config.evolution_trace.enabled:
             trace_output_path = self.config.evolution_trace.output_path
             if not trace_output_path:
@@ -165,11 +167,9 @@ class OpenEvolve:
                 compress=self.config.evolution_trace.compress,
             )
             logger.info(f"Evolution tracing enabled: {trace_output_path}")
-        else:
-            self.evolution_tracer = None
 
         # Initialize improved parallel processing components
-        self.parallel_controller = None
+        self.parallel_controller: Optional[ProcessParallelController] = None
 
     def _setup_logging(self) -> None:
         """Set up logging"""
@@ -278,7 +278,9 @@ class OpenEvolve:
                 id=initial_program_id,
                 code=self.initial_program_code,
                 changes_description=self.config.prompt.initial_changes_description,
-                language=self.config.language,
+                # Config.language is Optional; the block above resolves it from
+                # the initial program, so this is only a type-level default.
+                language=self.config.language or "python",
                 metrics=initial_metrics,
                 iteration_found=start_iteration,
             )
@@ -315,7 +317,7 @@ class OpenEvolve:
 
         # Initialize improved parallel processing
         try:
-            self.parallel_controller = ProcessParallelController(
+            parallel_controller = ProcessParallelController(
                 self.config,
                 self.evaluation_file,
                 self.database,
@@ -323,14 +325,15 @@ class OpenEvolve:
                 file_suffix=self.config.file_suffix,
                 island_selector=self.island_selector,
             )
+            self.parallel_controller = parallel_controller
 
             # Set up signal handlers for graceful shutdown
-            def signal_handler(signum, frame):
+            def signal_handler(signum: int, frame: Optional[FrameType]) -> None:
                 logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-                self.parallel_controller.request_shutdown()
+                parallel_controller.request_shutdown()
 
                 # Set up a secondary handler for immediate exit if user presses Ctrl+C again
-                def force_exit_handler(signum, frame):
+                def force_exit_handler(signum: int, frame: Optional[FrameType]) -> None:
                     logger.info("Force exit requested - terminating immediately")
                     import sys
 
@@ -341,7 +344,7 @@ class OpenEvolve:
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
 
-            self.parallel_controller.start()
+            parallel_controller.start()
 
             # When starting from iteration 0, we've already done the initial program evaluation
             # So we need to adjust the start_iteration for the actual evolution
@@ -500,16 +503,20 @@ class OpenEvolve:
         logger.info(f"Using island-based evolution with {self.config.database.num_islands} islands")
         self.database.log_island_status()
 
+        parallel_controller = self.parallel_controller
+        if parallel_controller is None:
+            raise RuntimeError("Parallel controller not started")
+
         # Run the evolution process with checkpoint callback
-        await self.parallel_controller.run_evolution(
+        await parallel_controller.run_evolution(
             start_iteration, max_iterations, target_score, checkpoint_callback=self._save_checkpoint
         )
 
         # Check if shutdown or early stopping was triggered
-        if self.parallel_controller.shutdown_event.is_set():
+        if parallel_controller.shutdown_event.is_set():
             logger.info("Evolution stopped due to shutdown request")
             return
-        elif self.parallel_controller.early_stopping_triggered:
+        elif parallel_controller.early_stopping_triggered:
             logger.info("Evolution stopped due to early stopping - saving final checkpoint")
             # Continue to save final checkpoint for early stopping
 

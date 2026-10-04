@@ -10,7 +10,8 @@ import logging
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from types import TracebackType
+from typing import Any, Dict, List, Optional, TypedDict, Union
 
 from openevolve.utils.trace_export_utils import (
     append_trace_jsonl,
@@ -19,6 +20,16 @@ from openevolve.utils.trace_export_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TraceStats(TypedDict):
+    """Running statistics tracked by EvolutionTracer"""
+
+    total_traces: int
+    improvement_count: int
+    total_improvement: Dict[str, float]
+    best_improvement: Dict[str, float]
+    worst_decline: Dict[str, float]
 
 
 @dataclass
@@ -96,7 +107,7 @@ class EvolutionTracer:
         self.buffer_size = buffer_size
 
         # Track statistics
-        self.stats = {
+        self.stats: TraceStats = {
             "total_traces": 0,
             "improvement_count": 0,
             "total_improvement": {},
@@ -126,7 +137,7 @@ class EvolutionTracer:
 
         # For JSON format, keep all traces in memory
         if format == "json":
-            self.json_traces = []
+            self.json_traces: List[EvolutionTrace] = []
 
         logger.info(f"Evolution tracer initialized: {self.output_path}")
 
@@ -179,8 +190,12 @@ class EvolutionTracer:
 
             # Changes descriptions (large-codebase mode)
             if self.include_changes_description:
-                trace.parent_changes_description = getattr(parent_program, "changes_description", None)
-                trace.child_changes_description = getattr(child_program, "changes_description", None)
+                trace.parent_changes_description = getattr(
+                    parent_program, "changes_description", None
+                )
+                trace.child_changes_description = getattr(
+                    child_program, "changes_description", None
+                )
 
             # Optionally include prompts
             if self.include_prompts:
@@ -207,7 +222,7 @@ class EvolutionTracer:
         except Exception as e:
             logger.error(f"Error logging evolution trace: {e}")
 
-    def _update_stats(self, trace: EvolutionTrace):
+    def _update_stats(self, trace: EvolutionTrace) -> None:
         """Update running statistics"""
         self.stats["total_traces"] += 1
 
@@ -232,7 +247,7 @@ class EvolutionTracer:
                 if delta < self.stats["worst_decline"][metric]:
                     self.stats["worst_decline"][metric] = delta
 
-    def flush(self):
+    def flush(self) -> None:
         """Write buffered traces to file"""
         if not self.enabled or not self.buffer:
             return
@@ -268,7 +283,7 @@ class EvolutionTracer:
             ),
         }
 
-    def close(self):
+    def close(self) -> None:
         """Close the tracer and flush remaining data"""
         if not self.enabled:
             return
@@ -294,7 +309,9 @@ class EvolutionTracer:
                     "created_at": time.time(),
                     "include_code": self.include_code,
                     "include_prompts": self.include_prompts,
-                    "include_changes_description": getattr(self, "include_changes_description", True),
+                    "include_changes_description": getattr(
+                        self, "include_changes_description", True
+                    ),
                 }
                 export_traces(all_traces, self.output_path, format="hdf5", metadata=metadata)
 
@@ -308,11 +325,16 @@ class EvolutionTracer:
         if stats["worst_decline"]:
             logger.info(f"Worst declines: {stats['worst_decline']}")
 
-    def __enter__(self):
+    def __enter__(self) -> "EvolutionTracer":
         """Context manager entry"""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
         """Context manager exit"""
         self.close()
 
@@ -437,7 +459,9 @@ def extract_evolution_trace_from_checkpoint(
 
 
 def extract_full_lineage_traces(
-    checkpoint_dir: Union[str, Path], output_path: Optional[str] = None, format: str = "json"
+    checkpoint_dir: Union[str, Path],
+    output_path: Optional[Union[str, Path]] = None,
+    format: str = "json",
 ) -> List[Dict[str, Any]]:
     """
     Extract complete evolution traces with full lineage chains and prompts/actions

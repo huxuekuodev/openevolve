@@ -64,10 +64,20 @@ class EmbeddingClient:
         elif model_name in AZURE_EMBEDDING_MODELS:
             # get rid of the azure- prefix
             model_to_use = model_name.split("azure-")[-1]
+            # AzureOpenAI falls back to AZURE_OPENAI_ENDPOINT when azure_endpoint is None,
+            # so resolve both variables here and fail fast if neither is set
+            azure_endpoint = os.getenv("AZURE_API_ENDPOINT")
+            if azure_endpoint is None:
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            if azure_endpoint is None:
+                raise ValueError(
+                    "AZURE_API_ENDPOINT (or AZURE_OPENAI_ENDPOINT) must be set to use "
+                    "Azure embedding models"
+                )
             client = openai.AzureOpenAI(
                 api_key=os.getenv("AZURE_OPENAI_API_KEY"),
                 api_version=os.getenv("AZURE_API_VERSION"),
-                azure_endpoint=os.getenv("AZURE_API_ENDPOINT"),
+                azure_endpoint=azure_endpoint,
             )
         elif model_name in GEMINI_EMBEDDING_MODELS:
             gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -90,7 +100,8 @@ class EmbeddingClient:
                 of strings.
 
         Returns:
-            list: Embedding vector for the code or None if an error
+            list: Embedding vector for the code, a list of vectors when a list
+                of strings is passed, or an empty (list of) vector if an error
                 occurs.
         """
         if isinstance(code, str):
@@ -109,7 +120,9 @@ class EmbeddingClient:
                 return [d.embedding for d in response.data]
         except Exception as e:
             logger.info(f"Error getting embedding: {e}")
+            # Mirror the success-path shape: a single vector, or a list of vectors
+            empty_embedding: List[float] = []
             if single_code:
-                return [], 0.0
+                return empty_embedding
             else:
-                return [[]], 0.0
+                return [empty_embedding]

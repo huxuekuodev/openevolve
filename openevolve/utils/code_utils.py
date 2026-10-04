@@ -5,7 +5,6 @@ Utilities for code parsing, diffing, and manipulation
 import re
 from typing import Dict, List, Optional, Tuple, Union
 
-
 _STANDARD_DIFF_PATTERN = r"<<<<<<< SEARCH\n(.*?)=======\n(.*?)>>>>>>> REPLACE"
 _STANDARD_DIFF_MARKER = re.compile(
     r"^[ \t]*(<<<<<<< SEARCH|=======|>>>>>>> REPLACE)[ \t]*\r?$", re.MULTILINE
@@ -44,7 +43,7 @@ def parse_evolve_blocks(code: str) -> List[Tuple[int, int, str]]:
 
     in_block = False
     start_line = -1
-    block_content = []
+    block_content: List[str] = []
 
     for i, line in enumerate(lines):
         marker = _evolve_marker(line)
@@ -239,7 +238,8 @@ def parse_full_rewrite(llm_response: str, language: str = "python") -> Optional[
         Extracted code or None if not found
     """
     code_block_pattern = r"```" + language + r"\n(.*?)```"
-    matches = re.findall(code_block_pattern, llm_response, re.DOTALL)
+    # The pattern has exactly one capturing group, so findall yields whole strings
+    matches: List[str] = re.findall(code_block_pattern, llm_response, re.DOTALL)
 
     if matches:
         return matches[0].strip()

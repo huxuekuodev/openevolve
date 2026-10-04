@@ -2,25 +2,56 @@
 Pytest fixtures for integration tests with optillm server
 """
 
-import pytest
-import subprocess
-import time
 import os
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
+
+import pytest
 
 # Import our test utilities
 import sys
+
 sys.path.append(str(Path(__file__).parent.parent))
 from test_utils import (
-    start_test_server, 
-    stop_test_server, 
-    is_server_running, 
+    start_test_server,
+    stop_test_server,
+    is_server_running,
     get_integration_config,
     get_evolution_test_program,
-    get_evolution_test_evaluator
+    get_evolution_test_evaluator,
 )
+
+# When set to a truthy value, an unavailable optillm server is a hard failure
+# instead of a skip. CI sets this so a broken server can never silently turn the
+# whole integration suite green.
+REQUIRE_SERVER_ENV = "OPENEVOLVE_REQUIRE_LLM_SERVER"
+
+_SKIP_REASON = (
+    "optillm server unavailable (not running on localhost:8000 and could not be "
+    f"started). Install optillm and start it, or set {REQUIRE_SERVER_ENV}=1 to make "
+    "this a hard failure."
+)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tag everything collected below tests/integration/ with the `integration` marker."""
+    marker = pytest.mark.integration
+    for item in items:
+        if "integration" not in item.keywords:
+            item.add_marker(marker)
+
+
+def _require_or_skip(reason: str) -> None:
+    """Skip when the LLM server is only unavailable, fail when it is required."""
+    if os.environ.get(REQUIRE_SERVER_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        pytest.fail(reason, pytrace=False)
+    pytest.skip(reason)
+
+
+def _server_unavailable(reason: str) -> None:
+    """No optillm server and none can be started."""
+    _require_or_skip(f"{_SKIP_REASON} ({reason})")
 
 
 @pytest.fixture(scope="session")
@@ -31,7 +62,12 @@ def optillm_server():
         print("Using existing optillm server at localhost:8000")
         yield {"proc": None, "port": 8000}  # Server already running, don't manage it
         return
-    
+
+    # A missing `optillm` executable must skip, not explode inside subprocess.
+    if shutil.which("optillm") is None:
+        _server_unavailable("the `optillm` executable is not on PATH")
+        return
+
     print("Starting optillm server for integration tests...")
     proc = None
     port = None
@@ -40,8 +76,9 @@ def optillm_server():
         print(f"optillm server started successfully on port {port}")
         yield {"proc": proc, "port": port}
     except Exception as e:
-        print(f"Failed to start optillm server: {e}")
-        raise
+        # start_test_server already cleaned up its process on failure.
+        _server_unavailable(str(e))
+        return
     finally:
         if proc:
             print("Stopping optillm server...")
