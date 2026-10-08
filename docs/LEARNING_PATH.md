@@ -213,6 +213,7 @@ return {"combined_score": 0.85, "prompt_length": 7, "execution_time": 3}
 - 特征维度说明
 
 **要理解的机制**：
+
 - **双选择**：`build_prompt` 的 `parent_program` 和 `inspirations` 来自不同的采样路径，前者求稳、后者求新。
 - **模板覆盖**：`templates.py` 支持从文件系统加载自定义模板，可以不改代码就换提示词。
 - **`programs_as_changes_description`**：把"程序"当成"变更描述的累积"来进化。适合超大代码库——LLM 只改描述，代码由描述生成。

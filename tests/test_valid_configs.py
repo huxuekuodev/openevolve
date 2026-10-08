@@ -24,7 +24,16 @@ class TestConfigValidity(unittest.TestCase):
                     config_files.append(os.path.join(root, file))
         return config_files
 
-    @patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key-for-validation"})
+    # Configs resolve `${VAR}` api_key references at load time, so any variable a
+    # checked-in config references must be present for validation to pass. Add a
+    # placeholder for each one here (the values are never used to make a call).
+    @patch.dict(
+        os.environ,
+        {
+            "ANTHROPIC_API_KEY": "test-key-for-validation",
+            "DEEPSEEK_API_KEY": "test-key-for-validation",
+        },
+    )
     def test_import_config_files(self):
         """Attempt to import all config files"""
         config_files = self.collect_files()

@@ -4,17 +4,23 @@ checkpoint_interval: 5
 
 # LLM configuration
 llm:
-  primary_model: "gemini-2.5-flash-lite"
-  # primary_model: "gpt-5-mini"
-  # primary_model: "llama3.1-8b"
-  primary_model_weight: 0.8
-  secondary_model: "gemini-2.5-flash"
-  # secondary_model: "llama-4-scout-17b-16e-instruct"
-  # secondary_model: "gpt-5-nano"
-  secondary_model_weight: 0.2
-  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
-  # api_base: "https://api.cerebras.ai/v1"
-  # api_base: "https://api.openai.com/v1"
+  primary_model: "deepseek-flash"
+  primary_model_weight: 1.0
+  # Optional second model, mixed into the ensemble by weight. Costs ~6x more per
+  # token than deepseek-flash, so it stays off by default:
+  # secondary_model: "deepseek-v4-pro"
+  # secondary_model_weight: 0.2
+  api_base: "https://api.deepseek.com"
+  # OpenEvolve resolves ${VAR} at config-load time, so the key comes from
+  # $DEEPSEEK_API_KEY. Alternatively drop this line and export OPENAI_API_KEY
+  # (the OpenAI SDK reads that variable by default).
+  api_key: "${DEEPSEEK_API_KEY}"
+  # deepseek-flash has thinking mode ON by default (effort=high), and thinking
+  # tokens are billed as output tokens. An evolution run makes hundreds of calls,
+  # so "none" disables thinking for a much cheaper and faster loop. Use
+  # "low"/"high" if you want the model to reason before editing. Note that
+  # `temperature` only takes effect in non-thinking mode, which is what we want.
+  reasoning_effort: "none"
   temperature: 0.7
   max_tokens: 16000
   timeout: 120

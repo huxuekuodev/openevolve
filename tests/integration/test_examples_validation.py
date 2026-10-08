@@ -19,12 +19,22 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from openevolve.config import Config, load_config
 from openevolve.evaluator import Evaluator
 
+# Checked-in configs resolve `${VAR}` api_key references while loading, so every
+# variable that any config under configs/ or examples/ references must be present
+# for the config-validation tests below to pass. The values are placeholders and
+# are never used to make a request.
+CONFIG_ENV_VARS = {
+    "ANTHROPIC_API_KEY": "test-key",
+    "DEEPSEEK_API_KEY": "test-key",
+}
+
 
 class TestFunctionMinimizationExample(unittest.TestCase):
     """Integration tests for the function_minimization example"""
 
     EXAMPLE_DIR = PROJECT_ROOT / "examples" / "function_minimization"
 
+    @patch.dict(os.environ, CONFIG_ENV_VARS)
     def test_config_loads(self):
         """Test that the config file loads without errors"""
         config_path = self.EXAMPLE_DIR / "config.yaml"
@@ -85,7 +95,7 @@ class TestFunctionMinimizationExample(unittest.TestCase):
         result = evaluator_module.evaluate(str(program_path))
 
         # Check result structure
-        if hasattr(result, 'metrics'):
+        if hasattr(result, "metrics"):
             # EvaluationResult object
             metrics = result.metrics
         else:
@@ -159,6 +169,7 @@ class TestEvaluatorIntegration(unittest.TestCase):
             self.skipTest("function_minimization evaluator not found")
 
         from openevolve.config import EvaluatorConfig
+
         config = EvaluatorConfig(timeout=30, cascade_evaluation=True)
 
         evaluator = Evaluator(config, str(evaluator_path))
@@ -186,7 +197,7 @@ class TestEvaluatorIntegration(unittest.TestCase):
 class TestConfigIntegration(unittest.TestCase):
     """Integration tests for config loading across examples"""
 
-    @patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"})
+    @patch.dict(os.environ, CONFIG_ENV_VARS)
     def test_all_example_configs_load(self):
         """Test that all example config files can be loaded"""
         examples_dir = PROJECT_ROOT / "examples"
@@ -203,6 +214,7 @@ class TestConfigIntegration(unittest.TestCase):
             failure_msg = "\n".join([f"{path}: {error}" for path, error in failed_configs])
             self.fail(f"Failed to load configs:\n{failure_msg}")
 
+    @patch.dict(os.environ, CONFIG_ENV_VARS)
     def test_config_has_required_sections(self):
         """Test that loaded configs have required sections"""
         config_path = PROJECT_ROOT / "examples" / "function_minimization" / "config.yaml"
@@ -325,16 +337,12 @@ class TestExampleStructure(unittest.TestCase):
             # Check for config
             config_files = list(example_dir.glob("*config*.yaml"))
             self.assertGreater(
-                len(config_files), 0,
-                f"{example_name} should have at least one config file"
+                len(config_files), 0, f"{example_name} should have at least one config file"
             )
 
             # Check for evaluator
             evaluator_path = example_dir / "evaluator.py"
-            self.assertTrue(
-                evaluator_path.exists(),
-                f"{example_name} should have evaluator.py"
-            )
+            self.assertTrue(evaluator_path.exists(), f"{example_name} should have evaluator.py")
 
     def test_evaluators_are_importable(self):
         """Test that all evaluators can be imported without errors"""
@@ -344,30 +352,26 @@ class TestExampleStructure(unittest.TestCase):
         for evaluator_path in examples_dir.rglob("evaluator.py"):
             try:
                 spec = importlib.util.spec_from_file_location(
-                    f"evaluator_{evaluator_path.parent.name}",
-                    evaluator_path
+                    f"evaluator_{evaluator_path.parent.name}", evaluator_path
                 )
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
 
                 # Verify evaluate function exists
                 if not hasattr(module, "evaluate"):
-                    failed_imports.append(
-                        (str(evaluator_path), "Missing evaluate function")
-                    )
+                    failed_imports.append((str(evaluator_path), "Missing evaluate function"))
             except Exception as e:
                 failed_imports.append((str(evaluator_path), str(e)))
 
         if failed_imports:
             # Only fail if critical examples fail
             critical_failures = [
-                f for f in failed_imports
+                f
+                for f in failed_imports
                 if "function_minimization" in f[0] or "circle_packing" in f[0]
             ]
             if critical_failures:
-                failure_msg = "\n".join(
-                    [f"{path}: {error}" for path, error in critical_failures]
-                )
+                failure_msg = "\n".join([f"{path}: {error}" for path, error in critical_failures])
                 self.fail(f"Critical evaluators failed to import:\n{failure_msg}")
 
 
