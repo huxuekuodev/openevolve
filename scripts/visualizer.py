@@ -12,12 +12,17 @@ from flask import Flask, render_template, jsonify
 
 from manual import create_manual_blueprint
 
-
 logger = logging.getLogger(__name__)
 app = Flask(__name__, template_folder="templates")
 
 
 def find_latest_checkpoint(base_folder):
+    # Normalise first: shell tab-completion appends a trailing separator to
+    # directories, and `os.path.basename(".../checkpoint_50/")` is "" (not
+    # "checkpoint_50"), so the check below would silently miss a checkpoint path
+    # typed with a trailing slash and fall through to a glob that finds nothing.
+    base_folder = os.path.normpath(base_folder)
+
     # Check whether the base folder is itself a checkpoint folder
     if os.path.basename(base_folder).startswith("checkpoint_"):
         return base_folder
@@ -88,6 +93,7 @@ def load_evolution_data(checkpoint_folder):
         "checkpoint_dir": checkpoint_folder,
     }
 
+
 def sanitize_program_for_visualization(program: dict[str, Any]) -> None:
     for k, v in program["metrics"].items():
         if not check_json_float(v):
@@ -96,6 +102,7 @@ def sanitize_program_for_visualization(program: dict[str, Any]) -> None:
             for k, v in program["metadata"]["parent_metrics"].items():
                 if not check_json_float(v):
                     program["metadata"]["parent_metrics"][k] = None
+
 
 def check_json_float(v: Optional[float]) -> bool:
     return isinstance(v, Number) and not (math.isinf(v) or math.isnan(v))
@@ -191,7 +198,9 @@ def run_static_export(args):
 
 
 # Manual mode blueprint mounted at /manual
-app.register_blueprint(create_manual_blueprint(lambda: os.environ.get("EVOLVE_OUTPUT", "examples/")))
+app.register_blueprint(
+    create_manual_blueprint(lambda: os.environ.get("EVOLVE_OUTPUT", "examples/"))
+)
 
 
 if __name__ == "__main__":
@@ -234,6 +243,15 @@ if __name__ == "__main__":
         run_static_export(args)
 
     os.environ["EVOLVE_OUTPUT"] = args.path
-    logger.info(f"Starting server at http://{args.host}:{args.port} with log level {args.log_level.upper()}")
-    logger.info(f"Manual UI: http://{args.host}:{args.port}/manual")
+    logger.info(
+        f"Starting server at http://{args.host}:{args.port} with log level {args.log_level.upper()}"
+    )
+    # Print the evolution-tree UI first and as a bare URL: it is the page people
+    # actually want, and terminals only linkify a clean URL. The manual-mode queue
+    # lives at /manual and is empty unless the run used manual mode, so it must not
+    # be the only clickable link on screen.
+    logger.info(f"Evolution tree UI: http://{args.host}:{args.port}/")
+    logger.info(
+        f"Manual-mode queue (empty unless manual mode is on): http://{args.host}:{args.port}/manual"
+    )
     app.run(host=args.host, port=args.port, debug=args.debug)
